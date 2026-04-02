@@ -2,7 +2,7 @@ class Xc < Formula
   desc "Xcode project management for people who hate Xcode"
   homepage "https://github.com/broberson/homebrew-xc"
   url "https://github.com/broberson/homebrew-xc/releases/download/v0.1.2/xc-0.1.2.tar.gz"
-  sha256 "ee77f5347486cd6dd65d6d593de90a23c2a482908fa54327c7813198d0b9e807"
+  sha256 "99fc7bbd2b655cc4892d3dba56b4b89085a1a9e864f85404e745fb8dad41f379"
   license "MIT"
 
   depends_on "ruby" => ">= 4.0.2"
