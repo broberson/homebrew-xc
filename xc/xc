@@ -1,0 +1,563 @@
+#!/usr/bin/env ruby
+# xc — xcode project management for people who hate xcode
+
+require 'xcodeproj'
+require 'fileutils'
+require 'optparse'
+require 'find'
+require 'pathname'
+
+class XC
+  def initialize
+    @version = '0.1.2'
+    @operation_root = Dir.pwd
+    @project_root, @project_path = find_project_root
+    @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
+
+    @options = { targets: [], all_targets: false, verbose: false, force: false,
+                 release: false, derived_data: nil }
+
+    Dir.chdir(@project_root || @operation_root)
+  end
+
+  def run
+    command = ARGV.shift
+    parse_options
+
+    if %w(add remove rename list targets build run open).include? command
+      require_project!
+    end
+
+    case command
+    when 'add'
+      add_path(ARGV.shift || ".")
+    when 'remove'
+      remove_path(ARGV.shift || ".")
+    when 'rename'
+      rename_path(ARGV.shift, ARGV.shift)
+    when 'list'
+      list_files
+    when 'targets'
+      list_targets
+    when 'build'
+      build
+    when 'run'
+      run_app
+    when 'open'
+      puts "Opening #{@project_path} in Xcode..."
+      system('open', @project_path)
+    when '--help', '-h', nil
+      help
+    when '--version', '-v'
+      puts "xc #{@version}"
+      exit
+    else
+      puts "Unknown command: #{command}"
+      help
+      exit 1
+    end
+
+    @project.save if %w[add remove rename].include?(command)
+  end
+
+  # --- Options ---
+  def parse_options
+    OptionParser.new do |opts|
+      opts.on("--target NAME") { |t| @options[:targets] << t }
+      opts.on("--all-targets") { @options[:all_targets] = true }
+      opts.on("--verbose") { @options[:verbose] = true }
+      opts.on("--release") { @options[:release] = true }
+      opts.on("--derived-data-path PATH") { |p| @options[:derived_data] = p }
+    end.parse!(ARGV)
+  end
+
+  # --- Listing ---
+  def list_targets
+    puts "Available targets:"
+    @project.targets.each { |t| puts "- #{t.name}" }
+  end
+
+  def list_files
+    puts "Listing files by target:"
+    @project.targets.each do |t|
+      puts "#{t.name}:"
+      t.source_build_phase.files.each do |bf|
+        puts "  #{bf.file_ref&.path || '<unknown>'}"
+      end
+    end
+
+    puts "\nImplicit Swift files (not in project, but compiler includes them):"
+    swift_files = Dir.glob("**/*.swift").reject { |f| f.start_with?(".") }
+    project_files = @project.files.map(&:path)
+    (swift_files - project_files).each { |f| puts "  #{f}" }
+  end
+
+  # --- Add ---
+  def add_path(path)
+    abs_path = File.expand_path(path, @operation_root)
+
+    unless File.exist?(abs_path)
+      puts "File/folder does not exist: #{path}"
+      return
+    end
+
+    bundle = enclosing_bundle(abs_path)
+    if bundle
+      rel = relative_path(bundle)
+
+      existing = @project.files.find { |f| f.path == rel }
+      unless existing
+        group = group_for_operation_root
+        group.new_reference(rel)
+        puts "Added bundle #{rel}" if @options[:verbose]
+      else
+        puts "Skipped duplicate bundle #{rel}" if @options[:verbose]
+      end
+
+      return
+    end
+
+    targets = resolve_targets
+    base_group = group_for_operation_root
+
+    if File.directory?(abs_path)
+      if same_path?(abs_path, @operation_root)
+        # We're adding ".", so don't recreate the folder
+        Dir.children(abs_path).each do |entry|
+          next if entry.start_with?(".")
+          full = File.join(abs_path, entry)
+
+          if File.directory?(full)
+            add_folder(full, base_group, targets)
+          else
+            add_file(full, base_group, targets)
+          end
+        end
+      else
+        add_folder(abs_path, base_group, targets)
+      end
+    else
+      add_file(abs_path, base_group, targets)
+    end
+  end
+
+  def add_folder(folder_path, parent_group, targets)
+    name = File.basename(folder_path)
+    return if name.start_with?('.')
+
+    # 🔥 CRITICAL: handle bundles BEFORE creating group
+    if bundle_directory?(folder_path)
+      rel = relative_path(folder_path)
+
+      existing = @project.files.find { |f| f.path == rel }
+      unless existing
+        parent_group.new_reference(rel)
+        puts "Added bundle #{rel}" if @options[:verbose]
+      else
+        puts "Skipped duplicate bundle #{rel}" if @options[:verbose]
+      end
+
+      return
+    end
+
+    group = parent_group.groups.find { |g| g.name == name } || parent_group.new_group(name)
+
+    Dir.children(folder_path).each do |entry|
+      next if entry.start_with?('.')
+      full = File.join(folder_path, entry)
+
+      if File.directory?(full)
+        add_folder(full, group, targets)
+      else
+        add_file(full, group, targets)
+      end
+    end
+  end
+
+  def add_file(file, group, targets)
+    if (bundle = enclosing_bundle(file))
+      rel = relative_path(bundle)
+      existing = @project.files.find { |f| f.path == rel }
+      unless existing
+        group.new_reference(rel)
+        puts "Added bundle #{rel}" if @options[:verbose]
+      end
+      return
+    end
+
+    rel_path = relative_path(file)
+    file_ref = group.files.find { |f| f.path == rel_path } || group.new_file(rel_path)
+
+    targets.each do |t_name|
+      target = @project.targets.find { |t| t.name == t_name }
+      next unless target
+
+      unless target.source_build_phase.files.any? { |bf| bf.file_ref == file_ref }
+        target.source_build_phase.add_file_reference(file_ref)
+        puts "Added #{rel_path} → #{t_name}" if @options[:verbose]
+      end
+    end
+  end
+
+  # --- Remove ---
+  def remove_path(path, target = nil)
+    abs_path = File.expand_path(path, @operation_root)
+
+    bundle = enclosing_bundle(abs_path)
+
+    if bundle && same_path?(bundle, abs_path)
+      # It's a bundle itself → remove as a single file
+      remove_file(bundle, target)
+      return
+    elsif bundle
+      # Inside a bundle → skip
+      puts "Skipping removal inside bundle #{bundle}" if @options[:verbose]
+      return
+    end
+
+    if File.directory?(abs_path)
+      # Remove all files recursively
+      Dir.glob("#{abs_path}/**/*").each do |file|
+        next if File.directory?(file) || File.basename(file).start_with?('.')
+        remove_file(file, target)
+      end
+      # Remove the Xcode group for this folder
+      remove_group_for_path(abs_path)
+    else
+      remove_file(abs_path, target)
+    end
+  end
+
+  def remove_file(file, target = nil)
+    rel_path = relative_path(file)
+    file_ref = @project.files.find { |f| f.path == rel_path }
+    return unless file_ref
+
+    @project.targets.each do |t|
+      t.build_phases.each do |phase|
+        next unless phase.respond_to?(:remove_file_reference)
+        phase.remove_file_reference(file_ref)
+      end
+    end
+
+    puts "Removed #{rel_path}" if @options[:verbose]
+    file_ref.remove_from_project
+  end
+
+  def remove_group_for_path(path)
+    rel = relative_path(path)
+
+    # Use Xcodeproj helper to find group by relative path
+    group = @project.main_group.find_subpath(rel, true)
+    return unless group
+
+    # Capture parent first
+    parent = begin
+      group.parent
+    rescue RuntimeError
+      nil
+    end
+
+    puts "Removing group #{group.name}" if @options[:verbose]
+    group.remove_from_project
+
+    prune_empty_groups(parent)
+  end
+
+  def prune_empty_groups(start_group)
+    group = start_group
+
+    while group && group != @project.main_group
+      # Stop if the group has children — only prune empty groups
+      break unless group.children.empty?
+
+      # Capture parent before removing
+      parent = begin
+        group.parent
+      rescue RuntimeError
+        nil
+      end
+
+      puts "Pruned empty group #{group.name}" if @options[:verbose]
+      group.remove_from_project
+      group = parent
+    end
+  end
+
+  # --- Rename (file or folder, including disk) ---
+  def rename_path(old_path, new_path)
+    abs_old = File.expand_path(old_path, @operation_root)
+    abs_new = File.expand_path(new_path, @operation_root)
+
+    unless File.exist?(abs_old)
+      puts "Error: source path does not exist on disk: #{abs_old}"
+      return
+    end
+
+    # --- Rename on disk ---
+    FileUtils.mv(abs_old, abs_new)
+    puts "Renamed on disk: #{abs_old} → #{abs_new}"
+
+    # --- Update Xcode references ---
+    rel_old = relative_path(abs_old)
+    rel_new = relative_path(abs_new)
+
+    # Try file first
+    file_ref = @project.files.find { |f| f.path == rel_old }
+    if file_ref
+      file_ref.path = rel_new
+      file_ref.name = File.basename(rel_new)
+      puts "Updated Xcode file reference: #{rel_old} → #{rel_new}"
+      return
+    end
+
+    # Try group (folder)
+    group = @project.main_group.find_subpath(rel_old, false)
+    if group
+      group.name = File.basename(rel_new)
+      group.path = rel_new if group.path
+      rename_group_recursively(group, rel_old, rel_new)
+      puts "Updated Xcode group reference: #{rel_old} → #{rel_new}"
+      return
+    end
+
+    puts "Warning: path not found in project: #{rel_old}"
+  end
+
+  # --- Helper: recursively update Xcode group children ---
+  def rename_group_recursively(group, old_rel, new_rel)
+    group.files.each do |f|
+      f.path = f.path.sub(/^#{Regexp.escape(old_rel)}/, new_rel)
+    end
+
+    group.groups.each do |g|
+      if g.path
+        g.path = g.path.sub(/^#{Regexp.escape(old_rel)}/, new_rel)
+        g.name = File.basename(g.path)
+      end
+      rename_group_recursively(g, old_rel, new_rel)
+    end
+  end
+
+  # --- Build / Run ---
+  require 'open3'
+  require 'json'
+  require 'ruby-progressbar'
+  require 'tty-spinner'
+
+  require 'open3'
+  require 'json'
+  require 'tty-spinner'
+
+  def build
+    config  = @options[:release] ? "Release" : "Debug"
+    derived = @options[:derived_data] || "./.build"
+    scheme  = @project.targets.first.name
+
+    cmd = [
+      "xcodebuild",
+      "-json",
+      "-project", @project_path,
+      "-scheme", scheme,
+      "-configuration", config,
+      "-derivedDataPath", derived,
+      "-quiet"
+    ]
+
+    puts "Building #{config}..."
+
+    errors = []
+
+    spinner = TTY::Spinner.new("[:spinner] Building...", format: :dots)
+    spinner.auto_spin
+
+    Open3.popen3(*cmd) do |stdin, stdout, stderr, wait_thr|
+
+      handle_line = proc do |line|
+        # Try JSON first (mostly ignore, but keeps future-proofing)
+        begin
+          JSON.parse(line)
+        rescue JSON::ParserError
+          # Plain text parsing
+
+          # Match common compiler error formats (Swift + Clang)
+          if line.match(/:\d+:\d+:\s+error:/) ||
+             line.match(/^error:/)
+            errors << line.strip
+          end
+        end
+      end
+
+      t1 = Thread.new do
+        stdout.each_line { |line| handle_line.call(line) }
+      end
+
+      t2 = Thread.new do
+        stderr.each_line { |line| handle_line.call(line) }
+      end
+
+      t1.join
+      t2.join
+
+      status = wait_thr.value
+
+      if status.success?
+        spinner.success("Build succeeded")
+      else
+        spinner.error("Build failed")
+        if errors.any?
+          puts "\nErrors:\n"
+          errors.uniq.each { |e| puts e }
+        else
+          puts "\n(No structured errors captured — see raw output)"
+        end
+      end
+
+      spinner.stop
+
+      return status.success?
+    end
+  end
+
+  def run_app
+    build
+
+    config = @options[:release] ? "Release" : "Debug"
+    target = @project.targets.first
+    product = File.basename(target.product_reference.path)
+    path = File.join("./.build", "Build", "Products", config, product)
+
+    unless File.exist?(path)
+      puts "Built product not found at #{path}"
+      return
+    end
+
+    puts "Launching #{path}"
+    system("open", path)
+  end
+
+  # --- Helpers ---
+  def require_project!
+    unless @project
+      puts "No .xcodeproj found in current directory or parent directories."
+      exit 1
+    end
+  end
+
+  def find_project_root
+    dir = Dir.pwd
+    loop do
+      proj = Dir.glob(File.join(dir, "*.xcodeproj")).first
+      return [dir, proj] if proj
+      parent = File.expand_path("..", dir)
+      break if parent == dir
+      dir = parent
+    end
+    nil
+  end
+
+  def same_path?(a, b)
+    File.expand_path(a) == File.expand_path(b)
+  end
+
+  def relative_path(file)
+    Pathname.new(File.expand_path(file))
+      .relative_path_from(Pathname.new(@project_root))
+      .to_s
+  end
+
+  def group_for_operation_root
+    rel = Pathname.new(@operation_root)
+            .relative_path_from(Pathname.new(@project_root))
+            .to_s
+
+    return @project.main_group if rel == "." || rel.empty?
+
+    parts = rel.split(File::SEPARATOR)
+    group = @project.main_group
+    current_path = @project_root
+
+    parts.each do |part|
+      next if part.empty?
+      current_path = File.join(current_path, part)
+
+      # 🔥 stop if we hit a bundle
+      if bundle_directory?(current_path)
+        return group
+      end
+
+      group = group.groups.find { |g| g.name == part } || group.new_group(part)
+    end
+
+    group
+  end
+
+  def resolve_targets
+    return @project.targets.map(&:name) if @options[:all_targets] || @options[:targets].empty?
+    @options[:targets]
+  end
+
+  def bundle_directory?(path)
+    name = File.basename(path)
+    [
+      '.xcassets',
+      '.bundle',
+      '.framework',
+      '.app'
+    ].any? { |ext| name.end_with?(ext) }
+  end
+
+  def enclosing_bundle(path)
+    current = File.expand_path(path)
+
+    loop do
+      return current if bundle_directory?(current)
+
+      parent = File.expand_path("..", current)
+      return nil if parent == current
+
+      current = parent
+    end
+  end
+
+  def help
+    puts <<~HELP
+      xc #{@version}
+      Usage: xc <command> [path] [options]
+
+      Commands:
+        add <path>           — Add a file or folder to the Xcode project
+        remove <path>        — Remove a file or folder from the Xcode project
+        rename <old> <new>   — Rename a file or folder in the Xcode project
+        build                — Build the first target in the project
+        run                  — Build and run the first target
+        targets              — List available targets
+        list                 — List files by target (includes implicit Swift files)
+        open                 — Open the Xcode project in Xcode
+        --help, -h           — Show this help message
+
+      Options (can be combined with add, remove, rename, build, or run):
+        --target NAME        — Operate only on the target with the given NAME
+        --all-targets        — Operate on all targets in the project
+        --verbose            — Print detailed actions as they happen
+        --release            — Build using the Release configuration (default is Debug)
+        --derived-data-path PATH — Specify custom derived data path for build (default is .build)
+
+      Notes:
+        * xc scans for an .xcodeproj in the current or a parent directory to work with.
+        * Paths may be absolute or relative. Bundles (.xcassets, .bundle, .app)
+          are treated as single files when added or removed.
+
+      Examples:
+        xc add Source
+        xc remove Source/OldFile.swift
+        xc rename Old.swift New.swift
+        xc list
+        xc build --release
+        xc add Source --target MyApp --verbose
+        xc build --all-targets --derived-data-path /tmp/build
+    HELP
+  end
+end
+
+XC.new.run

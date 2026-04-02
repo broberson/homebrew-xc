@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+# release.rb — one-step release for xc Homebrew tap
+
+require 'fileutils'
+require 'digest'
+
+# === CONFIG ===
+SCRIPT_FILE = "xc/xc"
+SCRIPT_FOLDER = "xc"
+TAP_FORMULA = "Formula/xc.rb"
+REPO = "broberson/homebrew-xc"
+
+# === STEP 0: Get version from script ===
+script_content = File.read(SCRIPT_FILE)
+version_line = script_content.lines.find { |l| l =~ /^\s*@version\s*=/ }
+abort("Could not find @version in #{SCRIPT_FILE}") unless version_line
+VERSION = version_line.match(/@version\s*=\s*['"](.+)['"]/)[1]
+puts "Releasing version #{VERSION}"
+
+TAR_NAME = "xc-#{VERSION}.tar.gz"
+TMP_DIR = ".tmp"
+
+# === STEP 1: Prepare release folder ===
+FileUtils.rm_rf(TMP_DIR)
+FileUtils.mkdir_p("#{TMP_DIR}/#{SCRIPT_FOLDER}")
+FileUtils.cp_r("#{SCRIPT_FOLDER}/.", "#{TMP_DIR}/#{SCRIPT_FOLDER}")
+puts "Packaged #{SCRIPT_FOLDER}/ → #{TMP_DIR}/#{SCRIPT_FOLDER}/"
+
+# === STEP 2: Create tarball ===
+Dir.chdir(TMP_DIR) do
+  system("tar czf ../#{TAR_NAME} #{SCRIPT_FOLDER}") || abort("tar failed")
+end
+puts "Created tarball #{TAR_NAME}"
+
+# === STEP 3: Compute SHA256 ===
+sha256 = Digest::SHA256.file(TAR_NAME).hexdigest
+puts "SHA256: #{sha256}"
+
+# === STEP 4: Update formula ===
+formula_content = File.read(TAP_FORMULA)
+formula_content.sub!(/url\s+".*"/, "url \"https://github.com/#{REPO}/releases/download/v#{VERSION}/#{TAR_NAME}\"")
+formula_content.sub!(/sha256\s+".*"/, "sha256 \"#{sha256}\"")
+File.write(TAP_FORMULA, formula_content)
+puts "Updated formula #{TAP_FORMULA} with new URL and SHA256"
+
+# === STEP 5: Git commit, tag, push ===
+system("git add #{TAP_FORMULA}") || abort("git add failed")
+system("git commit -m 'Release v#{VERSION}'") || abort("git commit failed")
+system("git tag -a v#{VERSION} -m 'Release version #{VERSION}'") || abort("git tag failed")
+system("git push origin master --tags") || abort("git push failed")
+puts "Git commit, tag, and push done"
+
+# === STEP 6: GitHub release upload ===
+system("gh release create v#{VERSION} --target master --draft=false --prerelease=false --notes-from-tag")
+system("gh release upload v#{VERSION} #{TAR_NAME} --clobber --repo #{REPO}") || abort("GitHub release upload failed")
+puts "Uploaded tarball to GitHub release v#{VERSION}"
+
+# === STEP 7: Cleanup ===
+FileUtils.rm_rf(TMP_DIR)
+FileUtils.rm_f(TAR_NAME)
+puts "Cleaned up temporary files"
+puts "Release v#{VERSION} completed successfully!"
