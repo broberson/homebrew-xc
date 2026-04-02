@@ -6,6 +6,10 @@ require 'fileutils'
 require 'optparse'
 require 'find'
 require 'pathname'
+require 'open3'
+require 'json'
+require 'tty-spinner'
+
 
 class XC
   def initialize
@@ -340,15 +344,6 @@ class XC
   end
 
   # --- Build / Run ---
-  require 'open3'
-  require 'json'
-  require 'ruby-progressbar'
-  require 'tty-spinner'
-
-  require 'open3'
-  require 'json'
-  require 'tty-spinner'
-
   def build
     config  = @options[:release] ? "Release" : "Debug"
     derived = @options[:derived_data] || "./.build"
