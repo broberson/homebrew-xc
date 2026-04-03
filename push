@@ -1,0 +1,22 @@
+#!/bin/zsh
+
+# Only argument is the commit message
+message="$1"
+
+# Make sure a message was provided
+if [[ -z "$message" ]]; then
+  echo "Usage: $0 'commit message'"
+  exit 1
+fi
+
+# add modified files, commit, and push
+# create a new tag and release, update formula, push changes and tarball
+# update and upgrade brew to install new release
+# and run it to display the updated version number
+git add -A . && \
+    git commit -m "$message" && \
+    git push && \
+    ./release && \
+    brew update && \
+    brew upgrade && \
+    echo $(xc --help | head -n 1)
