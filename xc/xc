@@ -10,10 +10,9 @@ require 'open3'
 require 'json'
 require 'tty-spinner'
 
-
 class XC
   def initialize
-    @version = '0.1.2'
+    @version = '0.1.3'
     @operation_root = Dir.pwd
     @project_root, @project_path = find_project_root
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
@@ -108,81 +107,80 @@ class XC
     bundle = enclosing_bundle(abs_path)
     if bundle
       rel = relative_path(bundle)
-
       existing = @project.files.find { |f| f.path == rel }
+
       unless existing
-        group = group_for_operation_root
+        group = group_for_file_path(bundle)
         group.new_reference(rel)
         puts "Added bundle #{rel}" if @options[:verbose]
       else
         puts "Skipped duplicate bundle #{rel}" if @options[:verbose]
       end
-
       return
     end
 
     targets = resolve_targets
-    base_group = group_for_operation_root
 
     if File.directory?(abs_path)
       if same_path?(abs_path, @operation_root)
-        # We're adding ".", so don't recreate the folder
         Dir.children(abs_path).each do |entry|
           next if entry.start_with?(".")
           full = File.join(abs_path, entry)
 
           if File.directory?(full)
-            add_folder(full, base_group, targets)
+            add_folder(full, targets)
           else
-            add_file(full, base_group, targets)
+            add_file(full, targets)
           end
         end
       else
-        add_folder(abs_path, base_group, targets)
+        add_folder(abs_path, targets)
       end
     else
-      add_file(abs_path, base_group, targets)
+      add_file(abs_path, targets)
     end
   end
 
-  def add_folder(folder_path, parent_group, targets)
+  def add_folder(folder_path, targets)
     name = File.basename(folder_path)
     return if name.start_with?('.')
 
-    # 🔥 CRITICAL: handle bundles BEFORE creating group
     if bundle_directory?(folder_path)
       rel = relative_path(folder_path)
-
       existing = @project.files.find { |f| f.path == rel }
+
       unless existing
-        parent_group.new_reference(rel)
+        group = group_for_file_path(folder_path)
+        group.new_reference(rel)
         puts "Added bundle #{rel}" if @options[:verbose]
       else
         puts "Skipped duplicate bundle #{rel}" if @options[:verbose]
       end
-
       return
     end
 
-    group = parent_group.groups.find { |g| g.name == name } || parent_group.new_group(name)
+    # Ensure group exists
+    group_for_file_path(folder_path)
 
     Dir.children(folder_path).each do |entry|
       next if entry.start_with?('.')
       full = File.join(folder_path, entry)
 
       if File.directory?(full)
-        add_folder(full, group, targets)
+        add_folder(full, targets)
       else
-        add_file(full, group, targets)
+        add_file(full, targets)
       end
     end
   end
 
-  def add_file(file, group, targets)
+  def add_file(file, targets)
     if (bundle = enclosing_bundle(file))
       rel = relative_path(bundle)
       existing = @project.files.find { |f| f.path == rel }
+
       unless existing
+        group = group_for_file_path(bundle)
         group.new_reference(rel)
         puts "Added bundle #{rel}" if @options[:verbose]
       end
@@ -190,6 +188,8 @@ class XC
     end
 
     rel_path = relative_path(file)
+    group = group_for_file_path(file)
+
     file_ref = group.files.find { |f| f.path == rel_path } || group.new_file(rel_path)
 
     targets.each do |t_name|
@@ -210,22 +210,18 @@ class XC
     bundle = enclosing_bundle(abs_path)
 
     if bundle && same_path?(bundle, abs_path)
-      # It's a bundle itself → remove as a single file
       remove_file(bundle, target)
       return
     elsif bundle
-      # Inside a bundle → skip
       puts "Skipping removal inside bundle #{bundle}" if @options[:verbose]
       return
     end
 
     if File.directory?(abs_path)
-      # Remove all files recursively
       Dir.glob("#{abs_path}/**/*").each do |file|
         next if File.directory?(file) || File.basename(file).start_with?('.')
         remove_file(file, target)
       end
-      # Remove the Xcode group for this folder
       remove_group_for_path(abs_path)
     else
       remove_file(abs_path, target)
@@ -250,12 +246,9 @@ class XC
 
   def remove_group_for_path(path)
     rel = relative_path(path)
-
-    # Use Xcodeproj helper to find group by relative path
     group = @project.main_group.find_subpath(rel, true)
     return unless group
 
-    # Capture parent first
     parent = begin
       group.parent
     rescue RuntimeError
@@ -272,10 +265,8 @@ class XC
     group = start_group
 
     while group && group != @project.main_group
-      # Stop if the group has children — only prune empty groups
       break unless group.children.empty?
 
-      # Capture parent before removing
       parent = begin
         group.parent
       rescue RuntimeError
@@ -288,7 +279,7 @@ class XC
     end
   end
 
-  # --- Rename (file or folder, including disk) ---
+  # --- Rename ---
   def rename_path(old_path, new_path)
     abs_old = File.expand_path(old_path, @operation_root)
     abs_new = File.expand_path(new_path, @operation_root)
@@ -298,15 +289,12 @@ class XC
       return
     end
 
-    # --- Rename on disk ---
     FileUtils.mv(abs_old, abs_new)
     puts "Renamed on disk: #{abs_old} → #{abs_new}"
 
-    # --- Update Xcode references ---
     rel_old = relative_path(abs_old)
     rel_new = relative_path(abs_new)
 
-    # Try file first
     file_ref = @project.files.find { |f| f.path == rel_old }
     if file_ref
       file_ref.path = rel_new
@@ -315,7 +303,6 @@ class XC
       return
     end
 
-    # Try group (folder)
     group = @project.main_group.find_subpath(rel_old, false)
     if group
       group.name = File.basename(rel_new)
@@ -328,7 +315,6 @@ class XC
     puts "Warning: path not found in project: #{rel_old}"
   end
 
-  # --- Helper: recursively update Xcode group children ---
   def rename_group_recursively(group, old_rel, new_rel)
     group.files.each do |f|
       f.path = f.path.sub(/^#{Regexp.escape(old_rel)}/, new_rel)
@@ -362,34 +348,22 @@ class XC
     puts "Building #{config}..."
 
     errors = []
-
     spinner = TTY::Spinner.new("[:spinner] Building...", format: :dots)
     spinner.auto_spin
 
     Open3.popen3(*cmd) do |stdin, stdout, stderr, wait_thr|
-
       handle_line = proc do |line|
-        # Try JSON first (mostly ignore, but keeps future-proofing)
         begin
           JSON.parse(line)
         rescue JSON::ParserError
-          # Plain text parsing
-
-          # Match common compiler error formats (Swift + Clang)
-          if line.match(/:\d+:\d+:\s+error:/) ||
-             line.match(/^error:/)
+          if line.match(/:\d+:\d+:\s+error:/) || line.match(/^error:/)
             errors << line.strip
           end
         end
       end
 
-      t1 = Thread.new do
-        stdout.each_line { |line| handle_line.call(line) }
-      end
-
-      t2 = Thread.new do
-        stderr.each_line { |line| handle_line.call(line) }
-      end
+      t1 = Thread.new { stdout.each_line { |l| handle_line.call(l) } }
+      t2 = Thread.new { stderr.each_line { |l| handle_line.call(l) } }
 
       t1.join
       t2.join
@@ -409,7 +383,6 @@ class XC
       end
 
       spinner.stop
-
       return status.success?
     end
   end
@@ -434,7 +407,7 @@ class XC
   # --- Helpers ---
   def require_project!
     unless @project
-      puts "No .xcodeproj found in current directory or parent directories."
+      puts "No .xcodeproj found."
       exit 1
     end
   end
@@ -461,14 +434,13 @@ class XC
       .to_s
   end
 
-  def group_for_operation_root
-    rel = Pathname.new(@operation_root)
-            .relative_path_from(Pathname.new(@project_root))
-            .to_s
+  def group_for_file_path(path)
+    rel = relative_path(path)
+    dir = File.dirname(rel)
 
-    return @project.main_group if rel == "." || rel.empty?
+    return @project.main_group if dir == "." || dir.empty?
 
-    parts = rel.split(File::SEPARATOR)
+    parts = dir.split(File::SEPARATOR)
     group = @project.main_group
     current_path = @project_root
 
@@ -476,10 +448,7 @@ class XC
       next if part.empty?
       current_path = File.join(current_path, part)
 
-      # 🔥 stop if we hit a bundle
-      if bundle_directory?(current_path)
-        return group
-      end
+      break if bundle_directory?(current_path)
 
       group = group.groups.find { |g| g.name == part } || group.new_group(part)
     end
@@ -494,12 +463,7 @@ class XC
 
   def bundle_directory?(path)
     name = File.basename(path)
-    [
-      '.xcassets',
-      '.bundle',
-      '.framework',
-      '.app'
-    ].any? { |ext| name.end_with?(ext) }
+    %w[.xcassets .bundle .framework .app].any? { |ext| name.end_with?(ext) }
   end
 
   def enclosing_bundle(path)
@@ -507,51 +471,14 @@ class XC
 
     loop do
       return current if bundle_directory?(current)
-
       parent = File.expand_path("..", current)
       return nil if parent == current
-
       current = parent
     end
   end
 
   def help
-    puts <<~HELP
-      xc #{@version}
-      Usage: xc <command> [path] [options]
-
-      Commands:
-        add <path>           — Add a file or folder to the Xcode project
-        remove <path>        — Remove a file or folder from the Xcode project
-        rename <old> <new>   — Rename a file or folder in the Xcode project
-        build                — Build the first target in the project
-        run                  — Build and run the first target
-        targets              — List available targets
-        list                 — List files by target (includes implicit Swift files)
-        open                 — Open the Xcode project in Xcode
-        --help, -h           — Show this help message
-
-      Options (can be combined with add, remove, rename, build, or run):
-        --target NAME        — Operate only on the target with the given NAME
-        --all-targets        — Operate on all targets in the project
-        --verbose            — Print detailed actions as they happen
-        --release            — Build using the Release configuration (default is Debug)
-        --derived-data-path PATH — Specify custom derived data path for build (default is .build)
-
-      Notes:
-        * xc scans for an .xcodeproj in the current or a parent directory to work with.
-        * Paths may be absolute or relative. Bundles (.xcassets, .bundle, .app)
-          are treated as single files when added or removed.
-
-      Examples:
-        xc add Source
-        xc remove Source/OldFile.swift
-        xc rename Old.swift New.swift
-        xc list
-        xc build --release
-        xc add Source --target MyApp --verbose
-        xc build --all-targets --derived-data-path /tmp/build
-    HELP
+    puts "xc #{@version} — see source for usage"
   end
 end
 
