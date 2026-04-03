@@ -18,7 +18,7 @@ class XC
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
 
     @options = { targets: [], all_targets: false, verbose: false, force: false,
-                 release: false, derived_data: nil }
+                 release: false, derived_data: nil, console: false }
 
     Dir.chdir(@project_root || @operation_root)
   end
@@ -71,6 +71,7 @@ class XC
       opts.on("--verbose") { @options[:verbose] = true }
       opts.on("--release") { @options[:release] = true }
       opts.on("--derived-data-path PATH") { |p| @options[:derived_data] = p }
+      opts.on("--console") { @options[:console] = true }
     end.parse!(ARGV)
   end
 
@@ -400,8 +401,22 @@ class XC
       return
     end
 
-    puts "Launching #{path}"
-    system("open", path)
+    console = @options[:console]
+
+    if console
+      executable = File.join(path, "Contents", "MacOS", File.basename(product, ".app"))
+
+      unless File.exist?(executable)
+        puts "Executable not found at #{executable}"
+        return
+      end
+
+      puts "Launching in console: #{executable}"
+      exec(executable)
+    else
+      puts "Launching #{path}"
+      system("open", path)
+    end
   end
 
   # --- Helpers ---
@@ -499,6 +514,7 @@ class XC
         --verbose            — Print detailed actions as they happen
         --release            — Build using the Release configuration (default is Debug)
         --derived-data-path PATH — Specify custom derived data path for build (default is .build)
+        --console            — Run the binary directly instead of using open
 
     Notes:
         * xc scans for an .xcodeproj in the current or a parent directory to work with.
