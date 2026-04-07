@@ -7,10 +7,11 @@ require 'pathname'
 require 'open3'
 require 'json'
 require 'tty-spinner'
+require 'colored2'
 
 class XC
   def initialize
-    @version = '0.2.1'
+    @version = '0.2.2'
     @operation_root = Dir.pwd
     @project_root, @project_path = find_project_root
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
@@ -285,7 +286,7 @@ class XC
     puts "Building #{config}..."
     errors = []
     #spinner = TTY::Spinner.new("[:spinner] Building...", format: :dots)
-    spinner = TTY::Spinner.new(":spinner Building ...", format: :dots, success_mark: "✅", error_mark: "❌")
+    spinner = TTY::Spinner.new(":spinner Building ...", format: :dots, success_mark: "✔".green, error_mark: "✘".red)
     spinner.auto_spin
 
     Open3.popen3(*cmd) do |stdin, stdout, stderr, wait_thr|
@@ -301,7 +302,7 @@ class XC
       t1.join; t2.join
 
       status = wait_thr.value
-      status.success? ? spinner.success("succeeded") : spinner.error("failed")
+      status.success? ? spinner.success("succeeded".green) : spinner.error("failed".red)
       if !status.success? && errors.any?
         puts "\nErrors:\n"
         errors.uniq.each { |e| puts e }
