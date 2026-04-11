@@ -11,7 +11,7 @@ require 'colored2'
 
 class XC
   def initialize
-    @version = '0.2.2'
+    @version = '0.2.3'
     @operation_root = Dir.pwd
     @project_root, @project_path = find_project_root
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
@@ -317,6 +317,7 @@ class XC
     config = @options[:release] ? "Release" : "Debug"
     target = @project.targets.first
     product = File.basename(target.product_reference.path)
+    app_name = File.basename(product, ".app") # Extract name (e.g., "MyApp")
     derived = @options[:derived_data] || "./.build/#{@project_name}"
     path = File.join(derived, "Build", "Products", config, product)
 
@@ -325,8 +326,12 @@ class XC
       return
     end
 
+    # Kill existing instances before running the new one
+    puts "Stopping existing instances of #{app_name}..."
+    system("pkill", "-x", app_name)
+
     if @options[:console]
-      executable = File.join(path, "Contents", "MacOS", File.basename(product, ".app"))
+      executable = File.join(path, "Contents", "MacOS", app_name)
       unless File.exist?(executable)
         puts "Executable not found at #{executable}"
         return
@@ -338,6 +343,7 @@ class XC
       system("open", path)
     end
   end
+
 
   # --- Helpers ---
   def require_project!; exit puts("No .xcodeproj found.") unless @project; end
