@@ -11,7 +11,7 @@ require 'colored2'
 
 class XC
   def initialize
-    @version = '0.2.4'
+    @version = '0.3.0'
     @operation_root = Dir.pwd
     @project_root, @project_path = find_project_root
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
