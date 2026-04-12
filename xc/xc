@@ -11,7 +11,7 @@ require 'colored2'
 
 class XC
   def initialize
-    @version = '0.3.0'
+    @version = '0.3.1'
     @operation_root = Dir.pwd
     @project_root, @project_path = find_project_root
     @project = @project_path ? Xcodeproj::Project.open(@project_path) : nil
@@ -506,18 +506,58 @@ class XC
 
     @options[:release] = true
 
-    puts "Building release..."
+    parts = ["Building"]
+    parts << "packaging" if package_script
+    parts << "releasing" if release_script
+    puts "#{parts.join(", ")} ..."
+
     return unless build
 
     if package_script
-      puts "Running package script: #{package_script}"
-      system(package_script)
+      spinner = TTY::Spinner.new(":spinner Running package script ...", format: :dots, success_mark: "✔".green, error_mark: "✘".red)
+      spinner.auto_spin
+
+      output, status = run_script(package_script)
+
+      if status.success?
+        spinner.success("succeeded".green)
+      else
+        spinner.error("failed".red)
+        puts "\nPackage script failed. Output:\n"
+        puts output
+        return
+      end
+      spinner.stop
     end
 
     if release_script
-      puts "Running release script: #{release_script}"
-      system(release_script)
+      spinner = TTY::Spinner.new(":spinner Running release script ...", format: :dots, success_mark: "✔".green, error_mark: "✘".red)
+      spinner.auto_spin
+
+      output, status = run_script(release_script)
+
+      if status.success?
+        spinner.success("succeeded".green)
+      else
+        spinner.error("failed".red)
+        puts "\nRelease script failed. Output:\n"
+        puts output
+        return
+      end
+      spinner.stop
     end
+  end
+
+  def run_script(script)
+    output = ""
+    status = nil
+    Open3.popen3("bash", script) do |stdin, stdout, stderr, wait_thr|
+      t1 = Thread.new { stdout.each_line { |l| output << l } }
+      t2 = Thread.new { stderr.each_line { |l| output << l } }
+      t1.join; t2.join
+      status = wait_thr.value
+    end
+    [output, status]
   end
 
   def find_script(candidates)
