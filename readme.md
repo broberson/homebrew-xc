@@ -3,26 +3,35 @@
 currently focused on macOS development. iOS support may come someday.
 
 ```
-xc v0.1.0
+xc 0.3.1
 Usage: xc <command> [path] [options]
 
 Commands:
-  add <path>           — Add a file or folder to the Xcode project
-  remove <path>        — Remove a file or folder from the Xcode project
-  rename <old> <new>   — Rename a file or folder in the Xcode project
-  build                — Build the first target in the project
-  run                  — Build and run the first target
-  targets              — List available targets
-  list                 — List files by target (includes implicit Swift files)
-  open                 — Open the Xcode project in Xcode
-  --help, -h           — Show this help message
+    add <path>           — Add a file or folder to the Xcode project
+    remove <path>        — Remove a file or folder from the Xcode project
+    rename <old> <new>   — Rename a file or folder in the Xcode project
+    build                — Build the first target in the project
+    run                  — Build and run the first target
+    release              — Build release, run package.sh & release.sh if they exist
+    version              — Show version and build number of main target
+    targets              — List available targets
+    list                 — List files by target (includes implicit Swift files)
+    open                 — Open the Xcode project in Xcode
+    --help, -h           — Show this help message
 
 Options (can be combined with add, remove, rename, build, or run):
-  --target NAME        — Operate only on the target with the given NAME
-  --all-targets        — Operate on all targets in the project
-  --verbose            — Print detailed actions as they happen
-  --release            — Build using the Release configuration (default is Debug)
-  --derived-data-path PATH — Specify custom derived data path for build (default is .build)
+    --target NAME          — Operate only on the target with the given NAME
+    --all-targets          — Operate on all targets in the project
+    --verbose              — Print detailed actions as they happen
+    --release              — Build using Release configuration (default is Debug)
+    --install              — Build and install Release to /Applications
+    --derived-data-path    — Specify custom derived data path (default is .build)
+    --console              — Run binary directly instead of using open
+    --quick, -q            — Run without building first (assumes already built)
+    --bump                 — Increment build number by 1 before building
+    --bump-version         — Increment build number + version before building
+    --minor                — With --bump-version: bump minor (1.2.3 → 1.3.0)
+    --major                — With --bump-version: bump major (1.2.3 → 2.0.0)
 
 Notes:
   * xc scans for an .xcodeproj in the current or a parent directory to work with.
