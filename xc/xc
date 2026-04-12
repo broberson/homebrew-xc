@@ -18,7 +18,8 @@ class XC
     @project_name = @project_path ? File.basename(@project_path, '.xcodeproj') : nil
 
     @options = { targets: [], all_targets: false, verbose: false, force: false,
-                 release: false, install: false, derived_data: nil, console: false }
+                 release: false, install: false, derived_data: nil, console: false, quick: false,
+                 bump: false, bump_version: false, minor: false, major: false }
 
     Dir.chdir(@project_root || @operation_root)
   end
@@ -27,7 +28,7 @@ class XC
     command = ARGV.shift
     parse_options
 
-    if %w(add remove rename list targets build run clean open).include? command
+    if %w(add remove rename list targets build run clean open release version).include? command
       require_project!
     end
 
@@ -43,6 +44,8 @@ class XC
     when 'open'
       puts "Opening #{@project_path} in Xcode..."
       system('open', @project_path)
+    when 'release' then release
+    when 'version' then show_version
     when '--help', '-h', nil then help
     when '--version', '-v'
       puts "xc #{@version}"
@@ -66,6 +69,11 @@ class XC
       opts.on("--install") { @options[:release] = true; @options[:install] = true }
       opts.on("--derived-data-path PATH") { |p| @options[:derived_data] = p }
       opts.on("--console") { @options[:console] = true }
+      opts.on("--quick", "-q") { @options[:quick] = true }
+      opts.on("--bump") { @options[:bump] = true }
+      opts.on("--bump-version") { @options[:bump_version] = true }
+      opts.on("--minor") { @options[:minor] = true }
+      opts.on("--major") { @options[:major] = true }
     end.parse!(ARGV)
   end
 
@@ -73,6 +81,15 @@ class XC
   def list_targets
     puts "Available targets:"
     @project.targets.each { |t| puts "- #{t.name}" }
+  end
+
+  def show_version
+    require_project!
+    target = @project.targets.first
+    config = target.build_configurations.find { |c| c.name == "Release" }
+    version = config&.build_settings['MARKETING_VERSION'] || "Unknown"
+    build = config&.build_settings['CURRENT_PROJECT_VERSION'] || "Unknown"
+    puts "#{version} (#{build})"
   end
 
   def list_files
@@ -278,6 +295,8 @@ class XC
 
   # --- Build / Run / Install / Clean ---
   def build
+    bump_version_info if @options[:bump] || @options[:bump_version]
+
     config  = @options[:release] ? "Release" : "Debug"
     derived = @options[:derived_data] || "./.build/#{@project_name}"
     scheme  = @project.targets.first.name
@@ -286,29 +305,88 @@ class XC
            "-configuration", config, "-derivedDataPath", derived, "-quiet"]
 
     puts "Building #{config}..."
+    output = []
     errors = []
     spinner = TTY::Spinner.new(":spinner Building ...", format: :dots, success_mark: "✔".green, error_mark: "✘".red)
     spinner.auto_spin
 
     Open3.popen3(*cmd) do |stdin, stdout, stderr, wait_thr|
-      # ... (existing handle_line logic) ...
-      t1 = Thread.new { stdout.each_line { |l| l } } # Simplified for brevity
-      t2 = Thread.new { stderr.each_line { |l| errors << l if l.include?("error:") } }
+      t1 = Thread.new { stdout.each_line { |l| output << l } }
+      t2 = Thread.new { stderr.each_line { |l| output << l; errors << l if l.include?("error:") || l.include?("warning:") } }
       t1.join; t2.join
 
       status = wait_thr.value
       status.success? ? spinner.success("succeeded".green) : spinner.error("failed".red)
 
       if status.success? && @options[:install]
-        install # Trigger the copy to /Applications
-      elsif !status.success? && errors.any?
-        puts "\nErrors:\n"
-        puts errors.uniq
+        install
+      elsif !status.success?
+        puts "\nBuild failed. Showing relevant output:"
+        puts output.select { |l| l.include?("error:") || l.include?("warning:") || l.include?("BUILD FAILED") }.uniq
       end
 
       spinner.stop
       return status.success?
     end
+  end
+
+  def bump_version_info
+    all_builds = []
+    all_versions = []
+
+    @project.targets.each do |target|
+      target.build_configurations.each do |config|
+        build = config.build_settings['CURRENT_PROJECT_VERSION'].to_i
+        all_builds << build if build > 0
+        if @options[:bump_version]
+          ver = config.build_settings['MARKETING_VERSION']
+          all_versions << ver if ver
+        end
+      end
+    end
+
+    new_build = (all_builds.max || 0) + 1
+    puts "Bumping build number to #{new_build} across all targets/configurations" if @options[:verbose]
+
+    @project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['CURRENT_PROJECT_VERSION'] = new_build.to_s
+      end
+    end
+
+    if @options[:bump_version]
+      current_version = all_versions.max { |a, b| compare_versions(a, b) } || "0.0.0"
+      parts = current_version.split('.').map(&:to_i)
+      parts << 0 while parts.size < 3
+
+      if @options[:major]
+        parts[0] += 1
+        parts[1] = 0
+        parts[2] = 0
+      elsif @options[:minor]
+        parts[1] += 1
+        parts[2] = 0
+      else
+        parts[2] += 1
+      end
+
+      new_version = parts.join('.')
+      puts "Bumping version to #{new_version} across all targets/configurations" if @options[:verbose]
+
+      @project.targets.each do |target|
+        target.build_configurations.each do |config|
+          config.build_settings['MARKETING_VERSION'] = new_version
+        end
+      end
+    end
+
+    @project.save
+  end
+
+  def compare_versions(a, b)
+    av = a.split('.').map(&:to_i)
+    bv = b.split('.').map(&:to_i)
+    av <=> bv
   end
 
   def install
@@ -325,6 +403,8 @@ class XC
   end
 
   def run_app
+    return run_app_quick if @options[:quick]
+
     return unless build
 
     config   = @options[:release] ? "Release" : "Debug"
@@ -345,6 +425,37 @@ class XC
       return
     end
 
+    puts "Stopping existing instances of #{app_name}..."
+    system("pkill", "-x", app_name)
+
+    if @options[:console]
+      executable = File.join(path, "Contents", "MacOS", app_name)
+      puts "Launching in console: #{executable}"
+      exec(executable)
+    else
+      puts "Launching #{path}"
+      system("open", path)
+    end
+  end
+
+  def run_app_quick
+    config   = @options[:release] ? "Release" : "Debug"
+    target   = @project.targets.first
+    product  = target.product_reference.path
+
+    if @options[:install]
+      path = File.join("/Applications", product)
+    else
+      derived = @options[:derived_data] || "./.build/#{@project_name}"
+      path = File.join(derived, "Build", "Products", config, product)
+    end
+
+    unless Dir.exist?(path)
+      puts "App not found at #{path}"
+      return
+    end
+
+    app_name = File.basename(product, ".app")
     puts "Stopping existing instances of #{app_name}..."
     system("pkill", "-x", app_name)
 
@@ -384,6 +495,37 @@ class XC
     # FileUtils.rm_rf(derived) if Dir.exist?(derived)
 
     return status.success?
+  end
+
+  # --- Release ---
+  def release
+    require_project!
+
+    package_script = find_script(%w[package.sh bin/package.sh scripts/package.sh Scripts/package.sh])
+    release_script = find_script(%w[release.sh bin/release.sh scripts/release.sh Scripts/release.sh])
+
+    @options[:release] = true
+
+    puts "Building release..."
+    return unless build
+
+    if package_script
+      puts "Running package script: #{package_script}"
+      system(package_script)
+    end
+
+    if release_script
+      puts "Running release script: #{release_script}"
+      system(release_script)
+    end
+  end
+
+  def find_script(candidates)
+    candidates.each do |script|
+      path = File.join(@project_root, script)
+      return path if File.exist?(path)
+    end
+    nil
   end
 
 
@@ -438,28 +580,35 @@ class XC
 
   def help
     puts <<~HELP
-    xc #{@version}
-    Usage: xc <command> [path] [options]
+xc #{@version}
+Usage: xc <command> [path] [options]
 
-    Commands:
-        add <path>           — Add a file or folder to the Xcode project
-        remove <path>        — Remove a file or folder from the Xcode project
-        rename <old> <new>   — Rename a file or folder in the Xcode project
-        build                — Build the first target in the project
-        run                  — Build and run the first target
-        targets              — List available targets
-        list                 — List files by target (includes implicit Swift files)
-        open                 — Open the Xcode project in Xcode
-        --help, -h           — Show this help message
+Commands:
+    add <path>           — Add a file or folder to the Xcode project
+    remove <path>        — Remove a file or folder from the Xcode project
+    rename <old> <new>   — Rename a file or folder in the Xcode project
+    build                — Build the first target in the project
+    run                  — Build and run the first target
+    release              — Build release, run package.sh & release.sh if they exist
+    version              — Show version and build number of main target
+    targets              — List available targets
+    list                 — List files by target (includes implicit Swift files)
+    open                 — Open the Xcode project in Xcode
+    --help, -h           — Show this help message
 
-    Options (can be combined with add, remove, rename, build, or run):
-        --target NAME        — Operate only on the target with the given NAME
-        --all-targets        — Operate on all targets in the project
-        --verbose            — Print detailed actions as they happen
-        --release            — Build using the Release configuration (default is Debug)
-        --install            - Build and install Release configuration to /Applications
-        --derived-data-path PATH — Specify custom derived data path for build (default is .build)
-        --console            — Run the binary directly instead of using open
+Options (can be combined with add, remove, rename, build, or run):
+    --target NAME          — Operate only on the target with the given NAME
+    --all-targets          — Operate on all targets in the project
+    --verbose              — Print detailed actions as they happen
+    --release              — Build using Release configuration (default is Debug)
+    --install              — Build and install Release to /Applications
+    --derived-data-path    — Specify custom derived data path (default is .build)
+    --console              — Run binary directly instead of using open
+    --quick, -q            — Run without building first (assumes already built)
+    --bump                 — Increment build number by 1 before building
+    --bump-version         — Increment build number + version before building
+    --minor                — With --bump-version: bump minor (1.2.3 → 1.3.0)
+    --major                — With --bump-version: bump major (1.2.3 → 2.0.0)
     HELP
   end
 end
