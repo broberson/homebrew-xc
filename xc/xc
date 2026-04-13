@@ -506,11 +506,12 @@ class XC
 
     @options[:release] = true
 
-    parts = ["Building"]
-    parts << "packaging" if package_script
-    parts << "releasing" if release_script
+    parts = ["Cleaning, Building"]
+    parts << "Packaging" if package_script
+    parts << "Releasing" if release_script
     puts "#{parts.join(", ")} ..."
 
+    return unless clean
     return unless build
 
     if package_script
